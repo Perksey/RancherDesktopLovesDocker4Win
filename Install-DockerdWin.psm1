@@ -1,315 +1,389 @@
 <#
  .Synopsis
-  Install and manage Docker daemon for Windows.
+  Install and manage a native Docker daemon (Moby) for Windows containers next to Rancher Desktop.
 
  .Description
-  This module contains gernal supportive methods to setup and manage Docker daemon on Windows
-  Install Docker daemon for Windows. Execute with Windows Powershell (not Core) as administrator. 
+  Installs the open-source static dockerd.exe from download.docker.com as a Windows service that
+  listens on its own named pipe (\\.\pipe\docker_windows by default), so it never clashes with
+  Rancher Desktop's Linux engine on \\.\pipe\docker_engine. A docker CLI context ("docker-win")
+  points at it, so you switch engines with `docker context use` or `docker --context docker-win`.
+
+  Works in Windows PowerShell 5.1 and PowerShell 7+. Install/remove commands need an elevated shell.
 
  .Example
-   # Show a default display of this month. TODO
-   Show-Calendar
-
+   Import-Module .\Install-DockerdWin.psm1
+   Install-DockerPrerequisites          # enables the Containers feature; reboot afterwards
+   Install-DockerDaemon                 # latest stable engine, pipe + context "docker-win"
+   docker --context docker-win run --rm --isolation=process mcr.microsoft.com/windows/nanoserver:ltsc2022 cmd /c ver
 #>
 
-# If error in Azure VM -> upscale to Dv3 edition 
-# If error in config -> json cleanup
-# if error: error during connect: Get "http://%2F%2F.%2Fpipe%2FdockerDesktopLinuxEngine/v1.24/containers/json": open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified. 
-# --> update and shutdown WSL then reset cluster in RancherDesktop  
-
+Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-function Check-PSEnvironment {
-    if ($PSVersionTable.PSEdition -ne "Desktop") {
-        Write-Error "Wrong PowerShell Environment. Please execute in PowerShell Desktop."
-    }
 
-    #check for admin priviledges and run as admin
-    if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) { 
-        # Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs; exit 
-        Write-Error "Admin priviledges required. Please run PowerShell with elevated permissions."
+$script:StaticBaseUrl   = "https://download.docker.com/win/static/stable/x86_64"
+$script:ConfigDir       = Join-Path $env:ProgramData "docker\config"
+$script:ConfigFile      = Join-Path $script:ConfigDir "daemon.json"
+$script:DefaultInstall  = Join-Path $env:ProgramFiles "DockerWindowsEngine"
+
+# ---------------------------------------------------------------- helpers
+
+function Assert-Elevated {
+    $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "Administrator privileges required. Please run PowerShell elevated."
     }
 }
 
-# Generate, Export and configure TLS Certificate
-function GenerateCerts {
-    param (
-        [Parameter()]
-        [String]
-        $certPath
-    )
-
-    $ErrorActionPreference = "Stop"
-    if ([int](Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full"  -Name Release).Release -lt 393295) {
-        throw "Your version of .NET framework is not supported for this script, needs at least 4.6+"
-    }
-    $splat = @{
-        type              = "Custom" ;
-        KeyExportPolicy   = "Exportable";
-        Subject           = "CN=Docker Windows Daemon TLS Root";
-        CertStoreLocation = "Cert:\CurrentUser\My";
-        HashAlgorithm     = "sha256";
-        KeyLength         = 4096;
-        KeyUsage          = @("CertSign", "CRLSign");
-        TextExtension     = @("2.5.29.19 ={critical} {text}ca=1")
-    }
-    $rootCert = New-SelfSignedCertificate @splat
-    $splat = @{
-        Path     = "$certPath\rootCA.cer";
-        Value    = "-----BEGIN CERTIFICATE-----`n" + [System.Convert]::ToBase64String($rootCert.RawData, [System.Base64FormattingOptions]::InsertLineBreaks) + "`n-----END CERTIFICATE-----";
-        Encoding = "ASCII";
-    }
-    Set-Content @splat
-    $splat = @{
-        CertStoreLocation = "Cert:\CurrentUser\My";
-        DnsName           = "swarmmanager1", "localhost", "containerhost1";
-        Signer            = $rootCert ;
-        KeyExportPolicy   = "Exportable";
-        Provider          = "Microsoft Enhanced Cryptographic Provider v1.0";
-        Type              = "SSLServerAuthentication";
-        HashAlgorithm     = "sha256";
-        TextExtension     = @("2.5.29.37= {text}1.3.6.1.5.5.7.3.1");
-        KeyLength         = 4096;
-    }
-    $serverCert = New-SelfSignedCertificate @splat
-    $splat = @{
-        Path     = "$certPath\serverCert.cer";
-        Value    = "-----BEGIN CERTIFICATE-----`n" + [System.Convert]::ToBase64String($serverCert.RawData, [System.Base64FormattingOptions]::InsertLineBreaks) + "`n-----END CERTIFICATE-----";
-        Encoding = "Ascii"
-    }
-    Set-Content @splat
- 
-    $privateKeyFromCert = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($serverCert)
-    $splat = @{
-        Path     = "$certPath\privateKey.cer";
-        Value    = ("-----BEGIN RSA PRIVATE KEY-----`n" + [System.Convert]::ToBase64String($privateKeyFromCert.Key.Export([System.Security.Cryptography.CngKeyBlobFormat]::Pkcs8PrivateBlob), [System.Base64FormattingOptions]::InsertLineBreaks) + "`n-----END RSA PRIVATE KEY-----");
-        Encoding = "Ascii";
-    }
-    Set-Content @splat
- 
-    $splat = @{
-        CertStoreLocation = "Cert:\CurrentUser\My";
-        Subject           = "CN=clientCert";
-        Signer            = $rootCert ;
-        KeyExportPolicy   = "Exportable";
-        Provider          = "Microsoft Enhanced Cryptographic Provider v1.0";
-        TextExtension     = @("2.5.29.37= {text}1.3.6.1.5.5.7.3.2") ;
-        HashAlgorithm     = "sha256";
-        KeyLength         = 4096;
-    }
-    $clientCert = New-SelfSignedCertificate  @splat
-    $splat = @{
-        Path     = "$certPath\clientPublicKey.cer" ;
-        Value    = ("-----BEGIN CERTIFICATE-----`n" + [System.Convert]::ToBase64String($clientCert.RawData, [System.Base64FormattingOptions]::InsertLineBreaks) + "`n-----END CERTIFICATE-----");
-        Encoding = "Ascii";
-    }
-    Set-Content  @splat
-    $clientprivateKeyFromCert = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($clientCert)
-    $splat = @{
-        Path     = "$certPath\clientPrivateKey.cer";
-        Value    = ("-----BEGIN RSA PRIVATE KEY-----`n" + [System.Convert]::ToBase64String($clientprivateKeyFromCert.Key.Export([System.Security.Cryptography.CngKeyBlobFormat]::Pkcs8PrivateBlob), [System.Base64FormattingOptions]::InsertLineBreaks) + "`n-----END RSA PRIVATE KEY-----");
-        Encoding = "Ascii";
-    }
-    Set-Content  @splat
+function Enable-Tls12 {
+    # Windows PowerShell 5.1 may default to TLS 1.0/1.1
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 }
 
-function Install-DockerDeamon {
-    param (
-        [Parameter()]
-        [String]
-        $dockerCliVersion = "20.10.13",
-        [int]
-        $daemonPort = 2375,
-        [string]
-        $serviceName = "docker"
-    )
+function Get-RemoteFile {
+    param([Parameter(Mandatory)][string] $Uri, [Parameter(Mandatory)][string] $OutFile)
+    Enable-Tls12
+    $old = $ProgressPreference
+    $ProgressPreference = "SilentlyContinue"   # progress bar makes iwr ~10x slower in 5.1
+    try { Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile }
+    finally { $ProgressPreference = $old }
+}
 
-    Check-PSEnvironment
-
-    if (Get-Service $serviceName -ErrorAction SilentlyContinue) {
-        try {
-            Stop-Service $serviceName
-        }
-        catch {}
-
-        try {
-            Remove-DockerDeamon -serviceName $serviceName
-        }
-        catch {}
-    }
-
-    # Try to start prerequired services
-    try {
-        # On Windows 10 start CmService
-        # if([environment]::OSVersion.Version.Build -le 19043)  {
-        #     Start-Service CmService 
-        # }
-        
-        Start-Service vmcompute
-        Start-Service vmms
-
-        #     throw "CmService not installed or able to start."
-        # }
-        # if (-not (Start-Service vmcompute)) {
-        #     throw "VmCompute not installed or able to start."
-        # }
-        # if (-not (Start-Service vmms)) {
-        #     throw "VmmsService not installed or able to start."
-        # }
-    }
+function Assert-Sha256 {
+    param([Parameter(Mandatory)][string] $File, [Parameter(Mandatory)][string] $ShaUri, [switch] $AllowMissing)
+    $shaFile = "$File.sha256"
+    try { Get-RemoteFile -Uri $ShaUri -OutFile $shaFile }
     catch {
-        Write-Error "Prerequired services (containers and Hyper-V) not available or access denied! Please execute Install-DockerPrerequirements"
+        if ($AllowMissing) { Write-Warning "No published checksum at $ShaUri; skipping verification."; return }
+        throw
     }
-    $installDir = "$($Env:TEMP)\dockerInstall-$($dockerCliVersion)"
-    mkdir "$($installDir)" -Force
-    iwr -UseBasicParsing -OutFile "$($installDir)/docker.zip" https://download.docker.com/win/static/stable/x86_64/docker-$dockerCliVersion.zip 
-    mkdir $env:LOCALAPPDATA\Docker -Force
-    Expand-Archive "$($installDir)\docker.zip" -DestinationPath $env:LOCALAPPDATA -Force
-    [Environment]::SetEnvironmentVariable("Path", "$($env:path);$($env:LOCALAPPDATA)\docker", [System.EnvironmentVariableTarget]::Machine)
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
-
-    GenerateCerts -certPath "$($env:LOCALAPPDATA)\docker"
-
-    Add-DockerDeamon -enableTLS $false -daemonPort $daemonPort
-    
-    docker run hello-world
-    Remove-Item "$($installDir)/docker.zip"
-    rmdir "$($installDir)"
-
-    #[System.IO.Directory]::GetAccessControl("\\.\pipe\docker_engine") | Format-Table
-    #[System.IO.Directory]::SetAccessControl("\\.\pipe\docker_engine", (Get-WMIObject -ClassName Win32_ComputerSystem).Username, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow)
-    #
-    # dockerd  --debug --host tcp://0.0.0.0:3757
-    # docker context create docker-win --docker "host=tcp://0.0.0.0:3757"
-    #  docker context use docker-win
-
+    $expected = ((Get-Content $shaFile -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+    $actual = (Get-FileHash -Algorithm SHA256 $File).Hash.ToLowerInvariant()
+    Remove-Item $shaFile -Force
+    if ($expected -ne $actual) {
+        throw "SHA256 mismatch for $(Split-Path $File -Leaf): expected $expected, got $actual"
+    }
 }
-Export-ModuleMember -Function Install-DockerDeamon
 
-function Remove-DockerDeamon {
-    param (
-        [Parameter()]
-        [string]
-        $contextName = "docker-win",
-        [string]
-        $serviceName = "docker"
-    )
-
-    Stop-Service $serviceName
-
-    & "$($env:LOCALAPPDATA)\docker\dockerd.exe" --unregister-service `
-        --service-name $serviceName
-
-    # [Environment]::SetEnvironmentVariable("DOCKER_HOST", $null, [System.EnvironmentVariableTarget]::User)
-    # $env:DOCKER_HOST = $null
-
-    docker context use default
-    docker context rm $contextName
-
+function Find-DockerCli {
+    param([string] $InstallDir = $script:DefaultInstall)
+    $cmd = Get-Command docker -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
+    $local = Join-Path $InstallDir "docker.exe"
+    if (Test-Path $local) { return $local }
+    return $null
 }
-Export-ModuleMember -Function Remove-DockerDeamon
 
-function Add-DockerDeamon {
-    param (
-        [Parameter()]
-        [bool]
-        $enableTLS = $false,
-        [int]
-        $daemonPort = 2375,
-        [string]
-        $contextName = "docker-win",
-        [string]
-        $serviceName = "docker"
+function Get-DockerStaticVersion {
+    <#
+     .Synopsis
+      Returns the newest stable Docker version published as Windows static binaries.
+    #>
+    Enable-Tls12
+    $html = (Invoke-WebRequest -UseBasicParsing -Uri "$script:StaticBaseUrl/").Content
+    $versions = [regex]::Matches($html, 'docker-(?:engine_)?(\d+\.\d+\.\d+)\.zip') |
+        ForEach-Object { [version] $_.Groups[1].Value } |
+        Sort-Object -Unique -Descending
+    if (-not $versions) { throw "Could not find any Docker versions at $script:StaticBaseUrl/" }
+    return $versions[0].ToString()
+}
+Export-ModuleMember -Function Get-DockerStaticVersion
+
+# ---------------------------------------------------------------- prerequisites
+
+function Install-DockerPrerequisites {
+    <#
+     .Synopsis
+      Enables the Windows "Containers" feature (and optionally Hyper-V). Reboot afterwards.
+     .Parameter HyperV
+      Also enable Hyper-V. Only needed for --isolation=hyperv (e.g. images older/newer than
+      the host build, or Windows 10 hosts running ltsc2022 images). Process isolation on
+      Windows 11 / Server 2022+ does not need it. Not available on Windows Home.
+    #>
+    param([switch] $HyperV)
+    Assert-Elevated
+
+    $restart = $false
+    $features = @("Containers")
+    if ($HyperV) { $features += "Microsoft-Hyper-V" }
+    foreach ($f in $features) {
+        $state = (Get-WindowsOptionalFeature -Online -FeatureName $f).State
+        if ($state -ne "Enabled") {
+            $r = Enable-WindowsOptionalFeature -Online -FeatureName $f -All -NoRestart
+            if ($r.RestartNeeded) { $restart = $true }
+        }
+    }
+
+    Write-Host "Make sure WSL is current for Rancher Desktop: run 'wsl --update' (elevated)."
+    if ($restart) { Write-Warning "A restart is required before installing the daemon." }
+}
+Export-ModuleMember -Function Install-DockerPrerequisites
+
+function Uninstall-DockerPrerequisites {
+    param([switch] $HyperV)
+    Assert-Elevated
+    Disable-WindowsOptionalFeature -Online -FeatureName "Containers" -NoRestart | Out-Null
+    if ($HyperV) { Disable-WindowsOptionalFeature -Online -FeatureName "Microsoft-Hyper-V" -NoRestart | Out-Null }
+    Write-Warning "Restart to finish removing the features."
+}
+Export-ModuleMember -Function Uninstall-DockerPrerequisites
+
+# ---------------------------------------------------------------- daemon
+
+function Install-DockerDaemon {
+    <#
+     .Synopsis
+      Downloads the static Docker engine for Windows, registers it as a service on its own
+      named pipe, and creates a docker CLI context for it.
+     .Parameter Version
+      Docker version (e.g. 29.10.0) or "latest" (default).
+     .Parameter PipeName
+      Named pipe to listen on. Must differ from Rancher Desktop's "docker_engine".
+     .Parameter AccessGroup
+      Local group whose members may use the pipe without elevation. Created if missing and the
+      current user is added (sign out/in afterwards for it to take effect).
+     .Parameter DefaultIsolation
+      "process" or "hyperv" sets the daemon default; omit to keep Docker's default
+      (hyperv on Windows client, process on Windows Server).
+     .Parameter ContainerDiskSize
+      Default container scratch-disk size, e.g. "60GB" (Docker's default is 20GB).
+     .Parameter InstallCli
+      Also install the matching docker.exe CLI. Not needed when Rancher Desktop is installed,
+      because its CLI is already on PATH; this copy is NOT added to PATH to avoid shadowing it.
+     .Parameter UseContext
+      Switch the current user's default context to the Windows engine afterwards.
+    #>
+    param(
+        [string] $Version = "latest",
+        [string] $InstallDir = $script:DefaultInstall,
+        [string] $ServiceName = "docker",
+        [string] $PipeName = "docker_windows",
+        [string] $ContextName = "docker-win",
+        [string] $AccessGroup = "docker-users",
+        [ValidateSet("process", "hyperv")] [string] $DefaultIsolation,
+        [string] $ContainerDiskSize,
+        [switch] $InstallCli,
+        [switch] $UseContext
     )
+    Assert-Elevated
 
-    if ($enableTLS) {
-        & "$($env:LOCALAPPDATA)\docker\dockerd.exe" --register-service --host tcp://localhost:$daemonPort `
-            --service-name $serviceName `
-            --tlsverify `
-            --tlscacert=$($env:LOCALAPPDATA)\docker\rootca.cer `
-            --tlscert=$($env:LOCALAPPDATA)\docker\clientPublicKey.cer `
-            --tlskey=$($env:LOCALAPPDATA)\docker\clientPrivateKey.cer
+    if ($PipeName -eq "docker_engine") {
+        throw "Pipe 'docker_engine' is used by Rancher Desktop; choose another -PipeName."
+    }
+    if ((Get-WindowsOptionalFeature -Online -FeatureName "Containers").State -ne "Enabled") {
+        throw "The Windows 'Containers' feature is not enabled. Run Install-DockerPrerequisites and restart."
+    }
+
+    if ($Version -eq "latest") { $Version = Get-DockerStaticVersion }
+    Write-Host "Installing Docker engine $Version for Windows containers..."
+
+    if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
+        Write-Host "Existing '$ServiceName' service found, replacing it."
+        Uninstall-DockerDaemon -ServiceName $ServiceName -ContextName $ContextName -InstallDir $InstallDir -KeepFiles
+    }
+
+    $work = Join-Path $env:TEMP "docker-win-install-$Version"
+    New-Item $work -ItemType Directory -Force | Out-Null
+    try {
+        # Newer releases ship engine and CLI as separate zips; older ones only as docker-X.zip.
+        $engineZip = Join-Path $work "engine.zip"
+        $engineName = "docker-engine_$Version.zip"
+        try {
+            Get-RemoteFile -Uri "$script:StaticBaseUrl/$engineName" -OutFile $engineZip
+        }
+        catch {
+            $engineName = "docker-$Version.zip"
+            Get-RemoteFile -Uri "$script:StaticBaseUrl/$engineName" -OutFile $engineZip
+        }
+        # older docker-X.zip releases have no .sha256 next to them
+        Assert-Sha256 -File $engineZip -ShaUri "$script:StaticBaseUrl/$engineName.sha256" -AllowMissing
+
+        $extract = Join-Path $work "extract"
+        Expand-Archive $engineZip -DestinationPath $extract -Force
+
+        if ($InstallCli -and $engineName -like "docker-engine_*") {
+            $cliZip = Join-Path $work "cli.zip"
+            Get-RemoteFile -Uri "$script:StaticBaseUrl/docker-cli_$Version.zip" -OutFile $cliZip
+            Assert-Sha256 -File $cliZip -ShaUri "$script:StaticBaseUrl/docker-cli_$Version.zip.sha256"
+            Expand-Archive $cliZip -DestinationPath $extract -Force
+        }
+
+        New-Item $InstallDir -ItemType Directory -Force | Out-Null
+        $dockerd = Get-ChildItem $extract -Recurse -Filter dockerd.exe | Select-Object -First 1
+        if (-not $dockerd) { throw "dockerd.exe not found in $engineName" }
+        Copy-Item (Join-Path $dockerd.DirectoryName "*") $InstallDir -Recurse -Force
+        if ($InstallCli) {
+            Get-ChildItem $extract -Recurse -Filter docker.exe |
+                Select-Object -First 1 | ForEach-Object { Copy-Item $_.FullName $InstallDir -Force }
+        }
+    }
+    finally {
+        Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # Pipe access for non-admin users
+    if ($AccessGroup) {
+        if (-not (Get-LocalGroup -Name $AccessGroup -ErrorAction SilentlyContinue)) {
+            New-LocalGroup -Name $AccessGroup -Description "Users allowed to use the Windows Docker engine" | Out-Null
+        }
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        if (-not (Get-LocalGroupMember -Group $AccessGroup -ErrorAction SilentlyContinue | Where-Object Name -eq $me)) {
+            Add-LocalGroupMember -Group $AccessGroup -Member $me
+            Write-Warning "Added $me to '$AccessGroup'. Sign out and back in to use the engine without elevation."
+        }
+    }
+
+    # daemon.json: merge into any existing config rather than clobbering it
+    New-Item $script:ConfigDir -ItemType Directory -Force | Out-Null
+    $config = @{}
+    if (Test-Path $script:ConfigFile) {
+        $existing = Get-Content $script:ConfigFile -Raw | ConvertFrom-Json
+        foreach ($p in $existing.PSObject.Properties) { $config[$p.Name] = $p.Value }
+    }
+    $config["hosts"] = @("npipe:////./pipe/$PipeName")
+    if ($AccessGroup) { $config["group"] = $AccessGroup }
+    if ($DefaultIsolation) { $config["exec-opts"] = @("isolation=$DefaultIsolation") }
+    if ($ContainerDiskSize) { $config["storage-opts"] = @("size=$ContainerDiskSize") }
+    # BOM-less UTF-8: dockerd rejects a BOM, which Set-Content -Encoding UTF8 writes in 5.1
+    [IO.File]::WriteAllText($script:ConfigFile, ($config | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding $false))
+
+    $dockerdExe = Join-Path $InstallDir "dockerd.exe"
+    & $dockerdExe --register-service --service-name $ServiceName --config-file $script:ConfigFile
+    if ($LASTEXITCODE) { throw "dockerd --register-service failed ($LASTEXITCODE)" }
+    Start-Service $ServiceName
+
+    # CLI context (per user)
+    $cli = Find-DockerCli -InstallDir $InstallDir
+    if (-not $cli) {
+        Write-Warning "No docker CLI found. Install Rancher Desktop or re-run with -InstallCli, then run: docker context create $ContextName --docker `"host=npipe:////./pipe/$PipeName`""
+        return
+    }
+    & $cli context inspect $ContextName *> $null
+    if ($LASTEXITCODE -eq 0) {
+        & $cli context update $ContextName --docker "host=npipe:////./pipe/$PipeName" | Out-Null
     }
     else {
-        & "$($env:LOCALAPPDATA)\docker\dockerd.exe" --register-service --host tcp://localhost:$daemonPort `
-            --service-name $serviceName
+        & $cli context create $ContextName --description "Windows containers (native dockerd)" --docker "host=npipe:////./pipe/$PipeName" | Out-Null
+    }
+    if ($UseContext) { & $cli context use $ContextName | Out-Null }
+
+    & $cli --context $ContextName version
+    Write-Host "Done. Use 'docker --context $ContextName ...' or 'docker context use $ContextName'."
+}
+Export-ModuleMember -Function Install-DockerDaemon
+
+function Update-DockerDaemon {
+    <#
+     .Synopsis
+      Re-installs the engine at the given (default: latest) version, keeping daemon.json and data.
+    #>
+    param([string] $Version = "latest", [string] $InstallDir = $script:DefaultInstall, [string] $ServiceName = "docker")
+    Assert-Elevated
+    if ($Version -eq "latest") { $Version = Get-DockerStaticVersion }
+    $current = $null
+    $exe = Join-Path $InstallDir "dockerd.exe"
+    if (Test-Path $exe) { $current = (& $exe --version) -replace '^Docker version ([^,]+),.*$', '$1' }
+    if ($current -eq $Version) { Write-Host "Already at $Version."; return }
+    Write-Host "Updating $current -> $Version"
+    $cfg = if (Test-Path $script:ConfigFile) { Get-Content $script:ConfigFile -Raw | ConvertFrom-Json } else { $null }
+    $pipe = "docker_windows"
+    $group = "docker-users"
+    if ($cfg -and ($cfg.PSObject.Properties.Name -contains "hosts")) { $pipe = ($cfg.hosts | Select-Object -First 1) -replace '^npipe:////\./pipe/', '' }
+    if ($cfg -and ($cfg.PSObject.Properties.Name -contains "group")) { $group = $cfg.group }
+    $withCli = Test-Path (Join-Path $InstallDir "docker.exe")
+    Install-DockerDaemon -Version $Version -InstallDir $InstallDir -ServiceName $ServiceName -PipeName $pipe -AccessGroup $group -InstallCli:$withCli
+}
+Export-ModuleMember -Function Update-DockerDaemon
+
+function Uninstall-DockerDaemon {
+    <#
+     .Synopsis
+      Stops and unregisters the service and removes the CLI context. Images/containers in
+      C:\ProgramData\docker are kept unless -RemoveData is given.
+    #>
+    param(
+        [string] $ServiceName = "docker",
+        [string] $ContextName = "docker-win",
+        [string] $InstallDir = $script:DefaultInstall,
+        [switch] $KeepFiles,
+        [switch] $RemoveData
+    )
+    Assert-Elevated
+
+    if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
+        Stop-Service $ServiceName -ErrorAction SilentlyContinue
+        $exe = Join-Path $InstallDir "dockerd.exe"
+        if (Test-Path $exe) {
+            & $exe --unregister-service --service-name $ServiceName
+        }
+        else {
+            sc.exe delete $ServiceName | Out-Null
+        }
     }
 
-    # [Environment]::SetEnvironmentVariable("DOCKER_HOST", "tcp://0.0.0.0:$daemonPort", [System.EnvironmentVariableTarget]::User)
-    # $env:DOCKER_HOST = [System.Environment]::GetEnvironmentVariable("DOCKER_HOST", "User")
-
-    Start-Service $serviceName
-
-    if ($enableTLS) {
-        docker context create docker-win --docker "host=tcp://0.0.0.0:$daemonPort,ca=$($env:LOCALAPPDATA)\docker\rootca.cer,cert=$($env:LOCALAPPDATA)\docker\clientPublicKey.cer,key=$($env:LOCALAPPDATA)\docker\clientPrivateKey.cer"
-    }
-    else {
-        docker context create docker-win --docker "host=tcp://0.0.0.0:$daemonPort"
+    $cli = Find-DockerCli -InstallDir $InstallDir
+    if ($cli) {
+        $currentCtx = (& $cli context show 2>$null)
+        if ($currentCtx -eq $ContextName) { & $cli context use default | Out-Null }
+        & $cli context rm $ContextName --force *> $null
     }
 
-    docker context use $contextName 
+    if (-not $KeepFiles) { Remove-Item $InstallDir -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($RemoveData) {
+        # Windows container layers have ACLs that block plain deletes; this is the documented-safe path
+        Write-Warning "Removing $env:ProgramData\docker (images, containers, volumes, daemon.json)."
+        Remove-Item (Join-Path $env:ProgramData "docker") -Recurse -Force
+    }
 }
-Export-ModuleMember -Function Add-DockerDeamon
-
-function Install-DockerPrerequirements {
-    Check-PSEnvironment
-
-    Enable-WindowsOptionalFeature -Online -FeatureName "Containers" -All -NoRestart
-    Enable-WindowsOptionalFeature -Online -FeatureName "Microsoft-Hyper-V" -All
-
-    Write-Warning "Please ensure WSL installed and up to date! (Run wsl --update in elevated shell, and wsl --shutdown in regular one)"
-}
-Export-ModuleMember -Function Install-DockerPrerequirements
-
-function Uninstall-DockerPrerequirements {
-    Check-PSEnvironment
-
-    Disable-WindowsOptionalFeature -Online -FeatureName "Containers" -NoRestart
-    Disable-WindowsOptionalFeature -Online -FeatureName "Microsoft-Hyper-V"
-}
-Export-ModuleMember -Function Uninstall-DockerPrerequirements
+Export-ModuleMember -Function Uninstall-DockerDaemon
 
 function Start-DockerBackend {
-    param (
-        [Parameter()]
-        [string]
-        $serviceName = "docker"
-    )
-
-    # Start-Service CmService 
-    Start-Service vmcompute 
-    Start-Service vmms 
-    Start-Service $serviceName
+    param([string] $ServiceName = "docker")
+    Start-Service $ServiceName
 }
 Export-ModuleMember -Function Start-DockerBackend
 
 function Stop-DockerBackend {
-    param (
-        [Parameter()]
-        [string]
-        $serviceName = "docker"
-    )
-
-    Stop-Service $serviceName
-    # Stop-Service CmService 
-    Stop-Service vmcompute 
-    Stop-Service vmms 
+    # Only the engine: stopping vmcompute/vmms would also take down WSL 2 and Rancher Desktop.
+    param([string] $ServiceName = "docker")
+    Stop-Service $ServiceName
 }
 Export-ModuleMember -Function Stop-DockerBackend
 
+# ---------------------------------------------------------------- compose
 
 function Install-DockerComposeWin {
-    param (
-        [Parameter()]
-        [String]
-        $dcVersion = "v2.3.3"
-    )
-    $ErrorActionPreference = "Stop"
-    
-    $dcInstallDir = "$($Env:TEMP)/dockerComsose-$dcVersion" 
-    mkdir $dcInstallDir -Force
-    Invoke-WebRequest -UseBasicParsing -OutFile "$($dcInstallDir)/docker-compose.exe" https://github.com/docker/compose/releases/download/$dcVersion/docker-compose-windows-x86_64.exe 
-    mkdir $ENV:HOMEPATH/.docker/cli-plugins -Force
-    Move-Item "$($dcInstallDir)/docker-compose.exe" $ENV:HOMEPATH/.docker/cli-plugins/ -Force
-    Remove-Item $dcInstallDir
+    <#
+     .Synopsis
+      Installs the docker compose CLI plugin for the current user.
+     .Description
+      Rancher Desktop already ships docker compose (and buildx); only use this without
+      Rancher Desktop, or to get a newer compose than it bundles.
+    #>
+    param([string] $Version = "latest")
+    Enable-Tls12
+    if ($Version -eq "latest") {
+        $Version = (Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/docker/compose/releases/latest").tag_name
+    }
+    if ($Version -notlike "v*") { $Version = "v$Version" }
+
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64" } else { "x86_64" }
+    $asset = "docker-compose-windows-$arch.exe"
+    $base = "https://github.com/docker/compose/releases/download/$Version"
+    $pluginDir = Join-Path $env:USERPROFILE ".docker\cli-plugins"
+    New-Item $pluginDir -ItemType Directory -Force | Out-Null
+    $target = Join-Path $pluginDir "docker-compose.exe"
+
+    Get-RemoteFile -Uri "$base/$asset" -OutFile "$target.download"
+    Assert-Sha256 -File "$target.download" -ShaUri "$base/$asset.sha256"
+    Move-Item "$target.download" $target -Force
+    Write-Host "Installed docker compose $Version to $target"
 }
 Export-ModuleMember -Function Install-DockerComposeWin
+
+# ---------------------------------------------------------------- backward-compatible names
+
+Set-Alias -Name Install-DockerDeamon -Value Install-DockerDaemon
+Set-Alias -Name Remove-DockerDeamon -Value Uninstall-DockerDaemon
+Set-Alias -Name Install-DockerPrerequirements -Value Install-DockerPrerequisites
+Set-Alias -Name Uninstall-DockerPrerequirements -Value Uninstall-DockerPrerequisites
+Export-ModuleMember -Alias Install-DockerDeamon, Remove-DockerDeamon, Install-DockerPrerequirements, Uninstall-DockerPrerequirements
