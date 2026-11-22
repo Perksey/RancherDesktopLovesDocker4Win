@@ -1,145 +1,186 @@
 # Rancher Desktop loves Docker for Windows
 
-This project contains support scripts and information to setup
+Rancher Desktop runs Linux containers (choose the **dockerd (moby)** engine to get the regular
+`docker` CLI), but it can't run Windows containers. This project adds the open-source Docker engine
+for **Windows containers** next to it, so you get both without Docker Desktop:
 
-- Rancher Desktop
-- Docker daemon for Windows OS based containers
-- docker compose CLI (Windows and WSL)
+| Engine | Runs | Named pipe | CLI context |
+|---|---|---|---|
+| Rancher Desktop (moby) | Linux containers in WSL 2 | `\\.\pipe\docker_engine` | `default` |
+| This module (`dockerd.exe`) | Windows containers, native | `\\.\pipe\docker_windows` | `docker-win` |
 
-as more powerfull replacement for Docker Desktop.
+Both are driven by the same `docker` CLI (the one Rancher Desktop puts on your `PATH`). Switch
+with `docker context use docker-win` / `docker context use default`, or per command with
+`docker --context docker-win ...`.
 
-## Setup How-To
+Everything here is open source: Rancher Desktop (Apache-2.0) and the Moby engine/CLI/Compose
+static binaries (Apache-2.0) from `download.docker.com`.
 
-The overall setup will take place in following steps.
+## Requirements
 
-1. Ensure prerequirements for Rancher Desktop are installed
-1. Install Rancher Desktop
-1. Install Docker daemon for Windows containers
-1. Install Docker Compose plugin
+- Windows 11 or Windows 10 (Pro/Enterprise/Education for Windows containers), or Windows Server 2022+
+- Windows PowerShell 5.1 or PowerShell 7+, run **as administrator** for install/remove
+- Hyper-V is only needed if you use `--isolation=hyperv`. On Windows 11 / Server 2022+ hosts,
+  `ltsc2022` images run with process isolation and don't need it. Windows 10 hosts need Hyper-V
+  isolation for `ltsc2022` images.
 
-### Import PowerShell support methods
+## Setup
 
-To simplify the setup there are several supporters in side the "Install-DockerdWin" PowerShell module. For using it
+### 1. Import the module
 
-1. Open a _Windows_ PowerShell instance with elevated permissions.
-1. Execute
+In an **elevated** PowerShell:
 
-   ```powershell
-   Import-Module '.\Install-DockerdWin.psm1'
-   ```
+```powershell
+Import-Module .\Install-DockerdWin.psm1
+```
 
-1. All following commands have to be performed within this instance of PowerShell.
+### 2. Enable the Windows features
 
-### Ensure prerequirements for Rancher Desktop are installed
+```powershell
+Install-DockerPrerequisites            # Containers feature only
+# Install-DockerPrerequisites -HyperV  # also Hyper-V, for --isolation=hyperv
+```
 
-As mentioned in [Rancher Desktop documentation](https://docs.rancherdesktop.io/getting-started/installation#windows) the vitualization capabilites and Windows Subsystem for Linux needs to be in place. Since we will install Docker daemon for Windows later we also need Container services enabled.
+Restart, then make sure WSL is current: `wsl --update` (elevated). If `wsl` isn't installed yet,
+`wsl --install` sets it up.
 
-1. Within the _Windows_ PowerShell perform
+### 3. Install Rancher Desktop
 
-   ```powershell
-   Install-DockerPrerequirements
-   ```
+1. Download and install [Rancher Desktop](https://rancherdesktop.io/). (This is SUSE's desktop app,
+   not the Rancher Kubernetes management server.)
+1. In **Preferences → Container Engine**, select **dockerd (moby)**.
+1. Disable Kubernetes under **Preferences → Kubernetes** if you don't need it.
+1. Check `docker version` in a new terminal.
 
-1. Restart the system
-1. Open _Windows_ PowerShell instance with elevated permissions and [import the module](#import-powershell-support-methods) again
-1. Ensure WSL is on latest version by executing `wsl --update` followed by `wsl --shutdown`
-   output should be something like this:
+### 4. Install the Windows container engine
 
-   ```powershell
-   PS C:\> wsl --update
-   Checking for updates...
-   No updates are available.
-   Kernel version: 5.10.60.1
-   PS C:\> wsl --shutdown
-   PS C:\>
-   ```
+Re-import the module in an elevated PowerShell, then:
 
-   if you get only the wsl help presented after `wsl --update` you will have installed wsl v1. To upgrade to wsl v2 please execute `wsl --install`
+```powershell
+Install-DockerDaemon
+```
 
-1. Restart the system
+This:
 
-### Install Rancher Desktop
+- downloads the latest stable static engine from `download.docker.com` and verifies its SHA256,
+- installs it to `C:\Program Files\DockerWindowsEngine` (deliberately **not** on `PATH`, so it
+  never shadows Rancher Desktop's `docker.exe`),
+- writes/merges `C:\ProgramData\docker\config\daemon.json` to listen on `\\.\pipe\docker_windows`,
+- registers and starts the `docker` Windows service,
+- creates a local `docker-users` group (and adds you) so you can use the engine without elevation.
+  **Sign out and back in once** for the group membership to apply,
+- creates the `docker-win` CLI context.
 
-To install Rancher Desktop, which is a separate solution from Rancher team and _not the classic kubernetes management interface_ from Rancher.com, perform the following steps, after prerequirements are setup:
+Useful options:
 
-1. Download and install [Rancher Desktop](https://rancherdesktop.io/).
-1. Restart system, if requried
-1. Start Rancher Desktop
-1. Set your favorit configuration. If you have used Docker Desktop in the past the docker(moby) configuration would be a good choice
-1. Open PowerShell / Terminal / PowerShell core and enter `docker version` to check docker for linux is up an running.
+```powershell
+Install-DockerDaemon -Version 29.10.0           # pin a version (default: latest)
+Install-DockerDaemon -DefaultIsolation process  # default isolation (Docker's default is hyperv on client Windows)
+Install-DockerDaemon -ContainerDiskSize 60GB    # container scratch disk (default 20GB)
+Install-DockerDaemon -UseContext                # make docker-win your default context
+Install-DockerDaemon -InstallCli                # also install docker.exe (only if you don't have Rancher Desktop)
+```
 
-### Install Docker daemon for Windows containers
+Try it:
 
-The install method will download the given verion of Docker CLI from gitHub and install it to you local user applications folder. Afterwards it will register and start up the agent.
+```powershell
+docker --context docker-win run --rm --isolation=process mcr.microsoft.com/windows/nanoserver:ltsc2022 cmd /c ver
+```
 
-1. [Prepare your PowerShell](#import-powershell-support-methods)
-1. Execute `Install-DockerDeamon`
+### 5. Docker Compose
 
-> **👍** Take care
->
-> If there is a warning regarding environment variable DOCKER_HOST is overruling context you should unset the variable to enable usage of docker-win context. To do so execute `$env:DOCER_HOST = $null` in your PowerShell instance.
+Rancher Desktop already ships `docker compose` (and `buildx`) for both Windows and its WSL
+distro, and it works against either context. You only need these if you don't use Rancher
+Desktop or want a newer Compose than it bundles:
 
-### Install Docker Compose plugin
+```powershell
+Install-DockerComposeWin                 # latest, verified, into %USERPROFILE%\.docker\cli-plugins
+```
 
-Docker compose can be installed with or without installing the Docker daemon for Windows containers. To use it everywhere it should be installed for Docker CLI in Windows and WSL separate.
+```sh
+./docker-compose_WSL.sh                  # inside a WSL distro; latest, verified
+```
 
-1. [Prepare your PowerShell](#import-powershell-support-methods) For this case no elevated permissions are required. It can run in PowerShell or PowerShell Core
-1. Execute `Install-DockerComposeWin`
-1. Check availability with `docker compose version`
-1. Switch to "Rancher-Desktop" WSL distribution by enter `wsl -d Rancher-Desktop`
-1. Execute `./docker-compose_WSL.sh` > if you are facing issues "Could not resolve host: github.com" please check [Troubleshoot WSL DNS](#Troubleshoot-WSL-DNS)
-1. Check availability with `docker compose version`
-1. Exit WSL `exit`
-1. Exit PowerShell
+A single `docker compose up` talks to one engine, so a project can't mix Linux and Windows
+containers. Run each side with its own `--context`.
 
-All done! You should now be able to use docker compose on Windows and Linux containers.
+## Day-to-day
 
-## Troubleshoots and known issues
+```powershell
+Update-DockerDaemon          # upgrade to the latest engine, keeping config, images and containers
+Stop-DockerBackend           # stop the Windows engine (leaves WSL / Rancher Desktop alone)
+Start-DockerBackend
+Uninstall-DockerDaemon       # remove service, context and binaries; keeps images/containers
+Uninstall-DockerDaemon -RemoveData   # ...and deletes C:\ProgramData\docker
+```
 
-This section contains known issues and errors you can face while setting up your environment.
+The old function names (`Install-DockerDeamon`, `Remove-DockerDeamon`,
+`Install-DockerPrerequirements`, `Uninstall-DockerPrerequirements`) still work as aliases.
+
+## Changes from the 2022 version
+
+- **Latest versions by default.** The engine and Compose versions are looked up at install
+  time instead of being pinned to Docker 20.10.13 / Compose 2.3.3. Downloads are checked against
+  their published SHA256.
+- **Named pipe instead of unauthenticated TCP.** The engine used to listen on `tcp://localhost:2375`
+  with no TLS, which gives every local process root-equivalent access. It now uses its own pipe,
+  restricted to Administrators and the `docker-users` group. The self-signed certificate code
+  is gone: TLS isn't needed for a pipe, and its "TLS mode" passed the *client* certificate as the
+  server certificate, so it never worked.
+- **Machine-wide install location.** Binaries used to go to the admin's `%LOCALAPPDATA%` (while
+  running as a system service) and were prepended to the machine `PATH`, where `docker.exe`
+  overrode Rancher Desktop's CLI. They now live in `Program Files`, off `PATH`.
+- **Rancher Desktop stays up.** `Stop-DockerBackend` used to stop `vmcompute`/`vmms`, which also
+  stops WSL 2 and therefore Rancher Desktop. It now stops only the engine.
+- **Hyper-V is optional**, since process isolation doesn't need it (and Windows Home doesn't have it).
+- **Fixed Compose paths.** The plugin was written to `$HOMEPATH` (no drive letter, so relative to
+  the current drive); it now goes to `%USERPROFILE%\.docker\cli-plugins`. The WSL script no longer
+  uses `curl -k`, which disabled certificate checks.
+- Works in PowerShell 7 as well as Windows PowerShell 5.1.
+
+## Troubleshooting
+
+### `docker --context docker-win ...` says access denied
+
+You aren't in `docker-users` yet, or haven't signed out and back in since being added. Elevated
+shells always have access.
+
+### Image/host version mismatch
+
+`The container operating system does not match the host operating system`: use an image whose
+build matches your host (e.g. `ltsc2025` on Windows 11 24H2 / Server 2025), or add
+`--isolation=hyperv` (requires the Hyper-V feature).
+
+### "There is not enough space on the disk" while building
+
+Raise the scratch-disk size: `Install-DockerDaemon -ContainerDiskSize 100GB` (merges into
+`daemon.json`), or edit `storage-opts` there and restart the `docker` service.
+
+### `DOCKER_HOST` overrides the context
+
+If `docker` warns that `DOCKER_HOST` overrides the context, clear it:
+`$env:DOCKER_HOST = $null` (and remove it from your user/system environment variables).
 
 ### Troubleshoot WSL DNS
 
-In some versions of WSL the DNS is not setup properly. If so, you can add your local networks DNS IP to forward requests. To check if you are in trouble with DNS setup check your internet connection in WSL with `traceroute 1.1.1.1`. You should see the following entries:
+Older WSL versions sometimes don't set up DNS correctly. Check with `traceroute 1.1.1.1` (works)
+and `traceroute github.com` (`bad address` means DNS is broken). Current WSL handles this
+better, so try `wsl --update` first, or enable DNS tunneling by putting this in `%USERPROFILE%\.wslconfig`:
 
-```bash
-traceroute to 1.1.1.1 (1.1.1.1), 30 hops max, 46 byte packets
- 1  host.rancher-desktop.internal (192.168.240.1)  2.131 ms  0.326 ms  0.614 ms
- 2  192.168.0.1 (192.168.0.1)  5.748 ms  5.017 ms  5.280 ms
- 3  *  *  *
- 4  92.79.244.82 (92.79.244.82)  9.306 ms  92.79.244.84 (92.79.244.84)  7.451 ms  8.496 ms
+```ini
+[wsl2]
+dnsTunneling=true
 ```
 
-The line starting with 1 represents the internal gateway in WSL. Line starting "2" is showing the IP of your local network gateway the (W)LAN you are connected with line "4" we are in the internet ...
-
-Now try to do the same with a domain address. Enter `traceroute github.com` and check the result. If it shows an error _traceroute: bad address 'github.com'_ your WSL is not able to resolve the IP by DNS.
-
-To solve this you can just add your local rancher host DNS to the network configuration in WSL by editing _/etc/resolv.conf_ file. To do so perform the folowing steps:
-
-1. vi /etc/resolv.conf
-1. :i
-1. Go to end of line press [Enter] and add your local rancher host IP e.g. `nameserver 192.168.240.1` (alternative: Add your local network gateway e.g. `nameserver 192.168.0.1`)
-1. Press escape to exit insert mode
-1. Enter `:wq` followed by [Enter]
-1. Ping google.com or github.com
-
-Now the internet address should be reachable.
+then `wsl --shutdown`. As a last resort, add a `nameserver <your gateway IP>` line to
+`/etc/resolv.conf` in the distro.
 
 ### Troubleshoot Kubernetes config issues
 
-If you’re already using Kubernetes contexts in your WSL, you will have to make some changes to you existing ~/kube/config:
+If you already use Kubernetes contexts in your WSL distro:
 
-1. Backup your existing ~/.kube/config file 😊
-1. Backup any existing config files under /mnt/c/Users/**[your-user-id]**/.kube/
-1. copy existing ~/.kube/config to /mnt/c/Users/**[your-user-id]**/.kube/:
-   `cp ~/.kube/config /mnt/c/Users/**[your-user-id]**/.kube/`
-1. “Reset Kubernetes” in Rancher Desktop /Kubernetes Settings. This will create the context for Rancher Desktop in your /mnt/c/Users/**[your-user-id]**/.kube/config
-1. Create a symlink of your new, central .kube/config in WSL:
-   `ln -s /mnt/c/Users/**[your-user-id]**/.kube/config ~/.kube/config`
-1. Now you’re ready to change context to Rancher Desktop even in WSL
-
-<!-- ## Cleanup the mess
-
-You are facing issues due to previous install tryouts or old setup stuff on your disk from other tools? Then it is time to clean up!
-
-1. Unregister Docker Service from  -->
+1. Back up `~/.kube/config` in WSL and any existing `/mnt/c/Users/<you>/.kube/config`.
+1. Copy your WSL config to Windows: `cp ~/.kube/config /mnt/c/Users/<you>/.kube/`
+1. In Rancher Desktop, **Troubleshooting → Reset Kubernetes**. This adds the `rancher-desktop`
+   context to `C:\Users\<you>\.kube\config`.
+1. Symlink it back into WSL: `ln -sf /mnt/c/Users/<you>/.kube/config ~/.kube/config`
