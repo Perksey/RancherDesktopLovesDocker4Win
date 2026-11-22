@@ -64,6 +64,28 @@ function Assert-Sha256 {
     }
 }
 
+function Invoke-NativeQuiet {
+    # Runs a native command, discarding all output, and returns its exit code.
+    # Windows PowerShell 5.1 turns redirected stderr from native commands into terminating
+    # errors under $ErrorActionPreference = 'Stop', so relax it for the duration.
+    param([Parameter(Mandatory)][string] $FilePath, [string[]] $ArgumentList = @())
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $FilePath @ArgumentList 2>&1 | Out-Null
+        return $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $old }
+}
+
+function Get-DockerContextNames {
+    param([Parameter(Mandatory)][string] $Cli)
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { return @(& $Cli context ls --format '{{.Name}}' 2>$null | ForEach-Object { $_.Trim() }) }
+    finally { $ErrorActionPreference = $old }
+}
+
 function Find-DockerCli {
     param([string] $InstallDir = $script:DefaultInstall)
     $cmd = Get-Command docker -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -257,8 +279,7 @@ function Install-DockerDaemon {
         Write-Warning "No docker CLI found. Install Rancher Desktop or re-run with -InstallCli, then run: docker context create $ContextName --docker `"host=npipe:////./pipe/$PipeName`""
         return
     }
-    & $cli context inspect $ContextName *> $null
-    if ($LASTEXITCODE -eq 0) {
+    if ((Get-DockerContextNames -Cli $cli) -contains $ContextName) {
         & $cli context update $ContextName --docker "host=npipe:////./pipe/$PipeName" | Out-Null
     }
     else {
@@ -322,9 +343,14 @@ function Uninstall-DockerDaemon {
 
     $cli = Find-DockerCli -InstallDir $InstallDir
     if ($cli) {
-        $currentCtx = (& $cli context show 2>$null)
-        if ($currentCtx -eq $ContextName) { & $cli context use default | Out-Null }
-        & $cli context rm $ContextName --force *> $null
+        if ((Get-DockerContextNames -Cli $cli) -contains $ContextName) {
+            $old = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try { $currentCtx = (& $cli context show 2>$null) }
+            finally { $ErrorActionPreference = $old }
+            if ($currentCtx -eq $ContextName) { Invoke-NativeQuiet $cli @('context', 'use', 'default') | Out-Null }
+            Invoke-NativeQuiet $cli @('context', 'rm', $ContextName, '--force') | Out-Null
+        }
     }
 
     if (-not $KeepFiles) { Remove-Item $InstallDir -Recurse -Force -ErrorAction SilentlyContinue }
